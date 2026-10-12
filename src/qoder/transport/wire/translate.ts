@@ -181,12 +181,24 @@ export async function validateAndTranslateMessages(
   const preserveThinking = pipeline?.preserveThinking ?? true
   const output: QoderWireMessage[] = []
   let lastAssistantToolCallIds: string[] = []
+  // Images relayed for a tool result are held back until the whole tool-result group that owns
+  // them has been answered. An OpenAI-compatible wire requires every id in an assistant
+  // message's `tool_calls` to be answered by tool messages before any other role appears, so
+  // relaying an image inline would strand the call ids that follow it and Qoder rejects the
+  // request with "insufficient tool messages following tool_calls message".
+  const deferredImageMessages: QoderWireMessage[] = []
+  const flushDeferredImageMessages = (): void => {
+    if (deferredImageMessages.length === 0) return
+    output.push(...deferredImageMessages.splice(0))
+  }
 
   if (typeof systemPrompt === 'string' && systemPrompt.trim().length > 0) {
     output.push({ role: 'system', content: systemPrompt })
   }
 
   for (const message of messages) {
+    // Anything that is not another tool result ends the group: relay its images first.
+    if (message.role !== 'tool') flushDeferredImageMessages()
     const toolResults = message.content.filter((block): block is ToolResultBlock => block.type === 'tool-result')
     const nonToolBlocks = message.content.filter(block => block.type !== 'tool-result')
 
@@ -201,7 +213,7 @@ export async function validateAndTranslateMessages(
         const images = result.content.filter((block): block is ImageBlock => block.type === 'image')
         if (images.length > 0) {
           if (attachments !== undefined) enforceImageLimits(images, attachments)
-          output.push({
+          deferredImageMessages.push({
             role: 'user',
             content: [
               {
@@ -286,7 +298,7 @@ export async function validateAndTranslateMessages(
         if (attachments !== undefined) {
           enforceImageLimits(pendingImages.map(pending => pending.block), attachments)
         }
-        output.push({
+        deferredImageMessages.push({
           role: 'user',
           content: [
             {
@@ -314,6 +326,8 @@ export async function validateAndTranslateMessages(
     }
 
     const wireRole = (toolResults.length > 0 ? 'user' : message.role) as 'system' | 'user'
+    // A non-tool message always closes the group whose images are still pending.
+    flushDeferredImageMessages()
     output.push({
       role: wireRole,
       content: hasImage
@@ -321,6 +335,7 @@ export async function validateAndTranslateMessages(
         : text,
     })
   }
+  flushDeferredImageMessages()
 
   return output
 }
