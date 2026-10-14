@@ -133,6 +133,7 @@ function waitForQueue(delayMs: number, signal?: AbortSignal): Promise<void> {
     signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
+
 /**
  * Chat entry point that waits out a queued model inside the transport.
  *
