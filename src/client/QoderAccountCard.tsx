@@ -202,6 +202,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
     const { profile, usage, plan } = accountState.account
     const userQuota = usage?.userQuota
     const orgPackage = usage?.orgResourcePackage
+    const addOnQuota = usage?.addOnQuota
     const dedicatedPackages = usage?.dedicatedResourcePackages ?? []
     const locale = activeLocale()
     const avatarInitial = (profile.name || profile.email || 'Q').charAt(0).toUpperCase()
@@ -210,6 +211,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
     const isSuspended = plan?.organization?.isSuspended === true
     const hasQuota = (userQuota?.total ?? 0) > 0
       || (orgPackage?.total ?? 0) > 0
+      || (addOnQuota?.total ?? 0) > 0
       || dedicatedPackages.some(pkg => pkg.total > 0)
     return (
       <div className={css.accountSection}>
@@ -253,6 +255,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
         {usage?.isQuotaExceeded ? <p className={css.error}>{t('quotaExceeded')}</p> : null}
         {renderQuota('userQuota', t('userQuotaTitle'), userQuota, { resetDate })}
         {renderQuota('orgResource', t('orgResourceTitle'), orgPackage, { resetDate })}
+        {renderQuota('addOnQuota', t('addOnQuotaTitle'), addOnQuota, { resetDate })}
         {dedicatedPackages.map((pkg, index) => renderQuota(
           `dedicatedResource-${pkg.id ?? index}`,
           resolveLocalizedText(pkg.title, locale) ?? t('dedicatedResourceTitle'),
@@ -271,7 +274,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
   const canModifySearchMode = modelSnapshot.status === 'ready' && modelSnapshot.writable
 
   const handleSearchModeChange = async (mode: QoderWebSearchMode) => {
-    if (!canModifySearchMode || mode === webSearchMode) return
+    if (!canModifySearchMode || webSearchMode === mode) return
     await operations.storeWebSearchMode(mode)
   }
 
@@ -286,7 +289,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
             type="button"
             role="radio"
             aria-checked={webSearchMode === 'auto'}
-            className={`${css.regionOption} ${webSearchMode === 'auto' ? css.regionOptionActive : ''}`}
+            className={`${css.regionOption}${webSearchMode === 'auto' ? ` ${css.regionOptionActive}` : ''}`}
             disabled={!canModifySearchMode}
             onClick={() => { void handleSearchModeChange('auto') }}
           >
@@ -296,7 +299,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
             type="button"
             role="radio"
             aria-checked={webSearchMode === 'always'}
-            className={`${css.regionOption} ${webSearchMode === 'always' ? css.regionOptionActive : ''}`}
+            className={`${css.regionOption}${webSearchMode === 'always' ? ` ${css.regionOptionActive}` : ''}`}
             disabled={!canModifySearchMode}
             onClick={() => { void handleSearchModeChange('always') }}
           >
@@ -306,7 +309,7 @@ function RegionAccountCard({ operations, t, activeLocale, modelSnapshot }: Qoder
             type="button"
             role="radio"
             aria-checked={webSearchMode === 'disabled'}
-            className={`${css.regionOption} ${webSearchMode === 'disabled' ? css.regionOptionActive : ''}`}
+            className={`${css.regionOption}${webSearchMode === 'disabled' ? ` ${css.regionOptionActive}` : ''}`}
             disabled={!canModifySearchMode}
             onClick={() => { void handleSearchModeChange('disabled') }}
           >
