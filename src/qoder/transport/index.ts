@@ -8,6 +8,7 @@ import type { QoderRegion } from '../region.ts'
 import { DefaultQoderTransport, defaultStreamIdleTimeoutMs } from './default-transport.ts'
 import { defaultResponseHeaderTimeoutMs } from './request.ts'
 import type { QoderLogger } from './logging.ts'
+import type { QoderQueueSleep } from './chat.ts'
 
 import type { WebSearchRequest, WebSearchResult } from '@deepseek-ai/dsh-web'
 
@@ -36,6 +37,21 @@ export interface QoderTransportOptions {
   imageUrlCacheTtlMs?: number
   /** Whether prior assistant reasoning content is preserved across turns. */
   preserveThinking?: boolean
+  /**
+   * Overrides how a queued model wait is performed.
+   *
+   * A test injects a no-op to observe the delays a queue reply produces without
+   * sleeping through them; production leaves it unset and waits for real.
+   */
+  queueSleep?: QoderQueueSleep
+  /**
+   * Overrides the jitter source for a queued wait.
+   *
+   * Injected only by tests, which need a fixed delay to assert a duration; the
+   * default keeps the production jitter that stops several clients from
+   * repeating one delay in lockstep.
+   */
+  queueRandom?: () => number
 }
 
 export function createQoderTransport(options: QoderTransportOptions): QoderTransport {

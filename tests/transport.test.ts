@@ -488,11 +488,17 @@ for (const source of ['http', 'sse'] as const) {
     test(`${source} business rejection ${businessCode} has correct classification and bounded recovery`, async () => {
       let chats = 0
       let exchanges = 0
+      const queueWaits: number[] = []
       const body = JSON.stringify({ code: '403', message: JSON.stringify({
         code: businessCode, message: JSON.stringify({ retryAfterSeconds: 30 }),
       }) })
       const transport = createQoderTransport({
         region: 'global', resolvePat: async () => 'pt-offline', resolveMachineId: () => 'offline-machine',
+        // A queued reply is waited out inside the transport, so record the waits
+        // instead of sleeping through them. Jitter is pinned to its midpoint so
+        // the recorded durations are assertable.
+        queueSleep: async (delayMs) => { queueWaits.push(delayMs) },
+        queueRandom: () => 0.5,
         fetch: (async input => {
           const url = String(input)
           if (url.includes('/exchange')) return new Response(JSON.stringify({ token: `jt-offline-${++exchanges}` }))
@@ -515,9 +521,34 @@ for (const source of ['http', 'sse'] as const) {
         assert.equal(error.failure.providerRetryAfterMs, 60_000)
         return true
       })
+      if (businessCode === '10605') {
+        // A queued model is not a failure the caller should see: the transport
+        // waits the hint the queue itself sent and asks again, repeating until
+        // the wait budget is spent.
+        assert.ok(chats > 1, `a queued model must be retried, saw ${chats} request(s)`)
+        assert.ok(queueWaits.length > 0, 'a queued model must produce at least one wait')
+        const waits = queueWaits.join(', ')
+        // Every wait follows the queue's own 30s hint. The last may be trimmed
+        // to whatever the budget has left, since each attempt's own duration is
+        // charged to that budget too. The 60s `retry-after` header must never
+        // appear: a throttling header is not a queue position.
+        assert.ok(queueWaits.every(wait => wait > 0 && wait <= 30_000), `unexpected waits: ${waits}`)
+        assert.ok(queueWaits.filter(wait => wait === 30_000).length >= 2,
+          `the 30s queue hint must drive the waits, saw: ${waits}`)
+        // The budget bounds the whole turn: a pool that never opens ends the
+        // turn instead of looping for as long as the caller is willing to wait.
+        const waitedTotal = queueWaits.reduce((total, wait) => total + wait, 0)
+        assert.ok(waitedTotal <= 120_000, `waits must fit the 2 minute budget: ${waitedTotal}ms (${waits})`)
+        assert.ok(chats <= 6, `the budget must bound the attempts, saw ${chats}`)
+        // Queueing is not an authentication failure, so the cached job token is
+        // reused rather than exchanged once per attempt.
+        assert.equal(exchanges, 1)
+        return
+      }
       const attempts = source === 'http' && businessCode === '105' ? 2 : 1
       assert.equal(chats, attempts)
       assert.equal(exchanges, attempts)
+      assert.equal(queueWaits.length, 0)
     })
   }
 }

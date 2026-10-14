@@ -14,6 +14,17 @@ export class QoderLlmError extends LlmError {
   upstreamCode?: string
   source?: 'http' | 'sse'
   httpStatus?: number
+  /**
+   * Delay the queue descriptor itself asked for, in milliseconds.
+   *
+   * Kept apart from `failure.providerRetryAfterMs`, which is the larger of this
+   * hint and any HTTP `retry-after` header. The two describe different things:
+   * a `retry-after` header answers "how long until this endpoint throttles you
+   * less", while the queue's own `retryAfterSeconds` is this request's position
+   * in a specific model queue. Only the latter tells the transport when to ask
+   * again, so the queue loop reads this field rather than the merged maximum.
+   */
+  queueRetryAfterMs?: number
   constructor(message: string, code: string = 'UNKNOWN_ERROR', options?: LlmErrorOptions) {
     super(message, code, options)
   }
@@ -121,6 +132,10 @@ export function qoderModelError(
   error.upstreamCode = details.upstreamCode
   error.source = response.source
   error.httpStatus = response.httpStatus ?? (response.source === 'http' ? response.status : undefined)
+  // The queue's own hint, unmerged. `details.delayMs` reads `retryAfterSeconds`
+  // out of the payload, so it is present only when the service actually queued
+  // this request; the HTTP header is not a queue position.
+  if (details.delayMs !== undefined) error.queueRetryAfterMs = details.delayMs
   return error
 }
 

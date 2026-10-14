@@ -21,7 +21,7 @@ import { QoderSearchClient } from './search.ts'
 import type { WebSearchRequest, WebSearchResult } from '@deepseek-ai/dsh-web'
 import type { QoderAccountInfo } from '../account.ts'
 import type { QoderTransport, QoderTransportOptions } from './index.ts'
-import { streamQoderChat } from './chat.ts'
+import { streamQoderChat, type QoderQueueSleep } from './chat.ts'
 
 export const defaultStreamIdleTimeoutMs = 5 * 60 * 1000
 
@@ -44,6 +44,8 @@ export class DefaultQoderTransport implements QoderTransport {
   private readonly imageUploader: QoderImageUploader
   private readonly searchClient: QoderSearchClient
   private readonly preserveThinking?: boolean
+  private readonly queueSleep?: QoderQueueSleep
+  private readonly queueRandom?: () => number
 
   constructor(options: QoderTransportOptions) {
     this.region = options.region
@@ -55,6 +57,8 @@ export class DefaultQoderTransport implements QoderTransport {
     this.metadataTimeoutMs = options.metadataTimeoutMs
     this.attachments = options.attachments
     this.preserveThinking = options.preserveThinking
+    this.queueSleep = options.queueSleep
+    this.queueRandom = options.queueRandom
     this.auth = new QoderAuthService({
       fetch: this.fetchImpl,
       logger: this.logger,
@@ -178,6 +182,17 @@ export class DefaultQoderTransport implements QoderTransport {
         this.auth.clear(pat)
         return this.auth.getCredentials(pat, signal)
       },
+      // A queued attempt is not a rejection, so this re-reads without evicting:
+      // the cached token survives unless it has actually expired.
+      renewCredentials: async (signal) => {
+        const renewed = await this.auth.getCredentials(pat, signal)
+        if (renewed.userID !== credentials.userID) {
+          throw new QoderLlmError('Qoder subscriber identity changed while the model was queued.', 'AUTH')
+        }
+        return renewed
+      },
+      ...this.queueSleep === undefined ? {} : { queueSleep: this.queueSleep },
+      ...this.queueRandom === undefined ? {} : { queueRandom: this.queueRandom },
     })
   }
 }

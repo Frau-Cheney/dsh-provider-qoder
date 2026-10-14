@@ -18,6 +18,15 @@ import { buildQoderRequestBody } from './wire/serialize.ts'
 import { parseQoderSse } from './wire/sse.ts'
 import type { QoderWireMessage } from './wire/wire-types.ts'
 
+/**
+ * Suspends the queue loop for one wait.
+ *
+ * Injectable so a test can observe the delays a queue reply produces without
+ * actually sleeping through them, which is also what makes the wait durations
+ * assertable rather than only the retry count.
+ */
+export type QoderQueueSleep = (delayMs: number, signal?: AbortSignal) => Promise<void>
+
 export interface QoderChatDependencies {
   fetch: typeof fetch
   logger?: QoderLogger
@@ -25,13 +34,177 @@ export interface QoderChatDependencies {
   responseHeaderTimeoutMs: number
   streamIdleTimeoutMs: number
   refreshCredentials?: (rejected: CosyCredentials, signal?: AbortSignal) => Promise<CosyCredentials>
+  /**
+   * Re-resolve the credentials a queued request will be sent with, without
+   * treating the current ones as rejected.
+   *
+   * A queued attempt is not an authentication failure, so this must not evict
+   * the cached token the way {@link QoderChatDependencies.refreshCredentials}
+   * does. The wait can still outlive one job token, so the queue loop asks again
+   * before retrying; an implementation that caches until near expiry costs
+   * nothing on the common path.
+   */
+  renewCredentials?: (signal?: AbortSignal) => Promise<CosyCredentials>
+  /** Overrides how a queued wait is performed. Defaults to a real timer. */
+  queueSleep?: QoderQueueSleep
+  /**
+   * Overrides the jitter source for a queued wait.
+   *
+   * Injected only by tests, which need a fixed delay to assert a duration; the
+   * default keeps the production jitter that stops several clients from
+   * repeating one delay in lockstep.
+   */
+  queueRandom?: () => number
 }
 
 function aborted(message: string): QoderLlmError {
   return new QoderLlmError(message, 'ABORTED')
 }
 
+/** Total time one queued turn may spend waiting for a free-model slot. */
+const qoderQueueBudgetMs = 2 * 60 * 1000
+/** Bounds on a single queued wait, so a bad hint cannot stall a turn for hours. */
+const qoderQueueMinWaitMs = 1000
+const qoderQueueMaxWaitMs = 30 * 1000
+/** Attempts that follow the queue's own hint before the backoff ladder starts. */
+const qoderQueueGraceAttempts = 3
+
+/**
+ * How long to wait before asking again, or `undefined` when this request must
+ * give up — either because the failure is not a queue, or because the budget is
+ * spent.
+ *
+ * Qoder defers a busy free-model pool with a `10605` business code carrying
+ * `retryAfterSeconds`, which `qoderModelError` already turned into a
+ * `RATE_LIMIT` failure with `providerRetryAfterMs`. Reading that classification
+ * rather than re-parsing the payload keeps one definition of what a queue is.
+ *
+ * The wait comes from `queueRetryAfterMs`, the hint the queue descriptor
+ * itself carried, and never from `providerRetryAfterMs`, which is the larger
+ * of that hint and any `retry-after` header. A throttling header is not a queue
+ * position: waiting on a header the queue never sent would turn each attempt
+ * into a much longer stall than the service asked for.
+ *
+ * A `RATE_LIMIT` from a plain HTTP 429 carries no business code and stays with
+ * the caller's retry policy: that is throttling, not a queue position.
+ *
+ * Past the grace attempts the hint is no longer trusted on its own: a queue
+ * that keeps repeating the same number is not making progress, so the wait
+ * grows instead of hammering the pool at one request per hint forever. That
+ * ladder is what keeps a hint-less queue (`retryAfterSeconds` absent, so the
+ * minimum is used) from degenerating into one request per second.
+ *
+ * Every wait is jittered because the free pool is shared: replaying one exact
+ * delay from several clients is what keeps their retries in lockstep. The
+ * cost of undershooting is a single extra rejection.
+ *
+ * The clamp into `[min, max]` happens *before* the remaining budget caps it,
+ * and deliberately so: with the floor applied last, a budget under the minimum
+ * would still sleep the full minimum and the budget would be decorative.
+ */
+function queueWaitMs(error: unknown, waitedMs: number, attempt: number, random: () => number): number | undefined {
+  if (!(error instanceof QoderLlmError)) return undefined
+  if (error.code !== 'RATE_LIMIT' || error.upstreamCode !== '10605') return undefined
+  const remaining = qoderQueueBudgetMs - waitedMs
+  if (remaining <= 0) return undefined
+  // A queue answer without a hint is still a queue: start from the minimum
+  // rather than dropping the request back to the caller.
+  const hinted = error.queueRetryAfterMs ?? qoderQueueMinWaitMs
+  const escalated = attempt > qoderQueueGraceAttempts
+    ? qoderQueueMinWaitMs * 2 ** Math.min(attempt - qoderQueueGraceAttempts, 8)
+    : 0
+  const target = Math.max(hinted, escalated) * (0.75 + random() * 0.5)
+  const clamped = Math.max(qoderQueueMinWaitMs, Math.min(target, qoderQueueMaxWaitMs))
+  return Math.min(clamped, remaining)
+}
+
+/** Wait `delayMs`, ending early when the caller aborts the request. */
+function waitForQueue(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(aborted('Request was aborted.'))
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(aborted('Request was aborted.'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+/**
+ * Chat entry point that waits out a queued model inside the transport.
+ *
+ * Qoder answers a busy free-model pool with `10605` plus a `retryAfterSeconds`
+ * hint while holding the request in a queue. That is not a failure — the client
+ * is expected to wait the hinted delay and ask again — but the failure carries
+ * a `providerRetryAfterMs` above the delay any retry policy accepts (30s
+ * observed against a 10s cap), so handing it straight back ends the turn on a
+ * pool that would have served it moments later. Waiting here, before the first
+ * frame reaches the caller, keeps the turn intact.
+ *
+ * Every attempt rebuilds its request instead of replaying bytes: the signature
+ * covers the body and `Cosy-Date`, so a replay is rejected as a duplicate.
+ * `buildQoderRequestBody` mints a fresh `request_id` while the turn tracker
+ * keeps `request_set_id` and `business.id`, so every attempt still reports as
+ * one agent run. Only attempts that produced no output are retried; once a
+ * frame has been handed to the caller the reply is already being written, and
+ * the failure is reported as-is.
+ */
 export async function* streamQoderChat(
+  options: GenerateOptions,
+  model: QoderCatalogModel | undefined,
+  credentials: CosyCredentials,
+  messages: QoderWireMessage[],
+  dependencies: QoderChatDependencies,
+): AsyncGenerator<StreamChunk> {
+  let waitedMs = 0
+  let activeCredentials = credentials
+  const sleep = dependencies.queueSleep ?? waitForQueue
+  const random = dependencies.queueRandom ?? Math.random
+  for (let attempt = 1; ; attempt++) {
+    if (options.signal?.aborted) throw aborted('Request was aborted.')
+    let emitted = false
+    // Everything this attempt costs — the handshake, the response headers, and
+    // the wait below — is charged to the budget, not only the wait. Counting
+    // just the wait is what makes a budget decorative: a queue that keeps
+    // answering slowly would spend unbounded time without ever exhausting it.
+    const attemptStartedAt = Date.now()
+    try {
+      for await (const chunk of streamQoderChatOnce(options, model, activeCredentials, messages, dependencies)) {
+        emitted = true
+        yield chunk
+      }
+      return
+    } catch (error: unknown) {
+      // A partial reply cannot be retried: the caller already holds frames.
+      if (emitted) throw error
+      waitedMs += Date.now() - attemptStartedAt
+      const delayMs = queueWaitMs(error, waitedMs, attempt, random)
+      // `undefined` covers both "not a queue" and "budget spent", and either
+      // way the caller — not this loop — decides what happens next.
+      if (delayMs === undefined) throw error
+      waitedMs += delayMs
+      if (dependencies.renewCredentials) {
+        try {
+          activeCredentials = await dependencies.renewCredentials(options.signal)
+        } catch {
+          // Keep the credentials we have; the attempt below reports the reason.
+        }
+      }
+      dependencies.logger?.debug?.('[Qoder Stream] Model queued, waiting before retry', {
+        delayMs,
+        waitedMs,
+        budgetMs: qoderQueueBudgetMs,
+        attempt,
+      })
+      await sleep(delayMs, options.signal)
+    }
+  }
+}
+
+async function* streamQoderChatOnce(
   options: GenerateOptions,
   model: QoderCatalogModel | undefined,
   credentials: CosyCredentials,
